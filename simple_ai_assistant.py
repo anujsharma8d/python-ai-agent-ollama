@@ -3,6 +3,7 @@ import os
 
 from openai import OpenAI
 from dotenv import load_dotenv
+from types import SimpleNamespace
 
 
 from tools import TOOLS,run_tool
@@ -22,9 +23,10 @@ messages = []
 messages.append(
     {
         "role":"system",
-        "content":"Act as a very humble agent and respond within 100 words"
+        "content":"Act as a very humble agent and respond with 1000 words"
     }
 )
+
 MAX_STEPS = 5
 
 while True:
@@ -40,32 +42,96 @@ while True:
         }
     )
 
+    def build_tool_calls_payload(call_list):
+        payload = []
+
+        for tool_call in call_list:
+            tool_call_dict={
+                "id":tool_call.id,
+                "type":"function",
+                "function":{
+                    "name":tool_call.function.name,
+                    "arguments":tool_call.function.arguments
+                }
+            }
+            payload.append(tool_call_dict)
+
+        return payload
 
     for step in range(MAX_STEPS):
 
-        response = client.chat.completions.create(
-            model=os.getenv("MODEL"),
-            messages=messages,
-            tools=TOOLS
-        )
+        try:
 
-        msg = response.choices[0].message
+            stream = client.chat.completions.create(
+                model=os.getenv("MODEL"),
+                messages=messages,
+                tools=TOOLS,
+                stream=True
+            )
+            
+            full_response = ""
+            calls = {}
+            showed = False
 
-        if not msg.tool_calls:
+            for chunk in stream:
+                if not chunk.choices:
+                    continue 
+
+                delta= chunk.choices[0].delta
+                if(delta.content):
+                    if not showed:
+                        print("Assistant: "+ delta.content, end= "",flush=True)
+                        showed = True
+                    else:
+                        print(delta.content, end= "",flush=True)
+                    
+                    full_response+=delta.content
+
+
+                for tool_call in (delta.tool_calls or []):
+                    obj = calls.setdefault(tool_call.index, SimpleNamespace(id=None ,function = SimpleNamespace(name="",arguments="") ))
+                    if(tool_call.id):
+                        obj.id = tool_call.id
+                    if(tool_call.function and tool_call.function.name):
+                        obj.function.name += tool_call.function.name
+                    if(tool_call.function and tool_call.function.arguments):
+                        obj.function.arguments += tool_call.function.arguments
+
+            if(showed):
+                print()
+
+            call_list = []
+            for key in sorted(calls):
+                call_list.append(calls[key])
+
+            messages.append(
+                {
+                    "role":"assistant",
+                    "content":full_response,
+                    "tool_calls":build_tool_calls_payload(call_list)
+                }
+            )
+
+            for tool_call in call_list:
+                result = run_tool(tool_call)
+
+                messages.append({
+                    "role":"tool",
+                    "tool_call_id":tool_call.id,
+                    "content":str(result)
+                })
+                
+
+            log(f"Step {step+1}: model requested {len(call_list)} tool calls")
+            
+            if not call_list:
+                break
+
+        except KeyboardInterrupt:
+            print()
+            print("{  Stopped by You  }")
             break
 
-        log(f"Step {step+1}: model requested {len(msg.tool_calls)} tool calls")
-
-        messages.append(msg)
-
-        for tool_call in msg.tool_calls:
-            result = run_tool(tool_call)
-
-            messages.append({
-                "role":"tool",
-                "tool_id":tool_call.id,
-                "content":str(result)
-            })
 
     else:
         fallback = "Sorry, I couldn't finish this within the step limit"
@@ -80,11 +146,3 @@ while True:
         print("Assistant: " + fallback)
         continue
         
-    messages.append(
-        {
-            "role":"assistant",
-            "content":msg.content
-        }
-    )
-
-    print("Assistant: " + (msg.content or ""))
